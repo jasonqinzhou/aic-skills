@@ -138,6 +138,12 @@ Classify each error group:
 
 Fix policy:
 
+- For API/import/signature errors:
+  1. Read `collector/<backend>/registry.py` to map the failing op to its collector module.
+  2. Read the failing `collector/<backend>/collect_*.py`.
+  3. Search the framework source checkout for the missing class, function, import path, or attribute.
+  4. Verify the real API in source. Do not trust Python's "Did you mean" suggestions blindly.
+  5. Patch the collector with a minimal compatibility-preserving change.
 - For API changes, use version routing and `__compat__` where needed.
 - For GPU capability gaps, filter test cases before execution using `get_sm_version()`.
 - For Blackwell/SM100+ features, gate FP4/NVFP4/FP8 paths carefully.
