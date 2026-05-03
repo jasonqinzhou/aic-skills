@@ -11,12 +11,28 @@ You are already on a GPU node with one or more GPUs. Your job is to collect AIC 
 
 This is a long-running workflow. Be persistent. Iterate carefully. Do not hide failures by shrinking coverage or deleting hard cases unless the configuration is genuinely unsupported and documented.
 
+## Operating Mode
+
+Assume the user wants the complete bring-up unless they explicitly ask for a smoke test only.
+
+- Run collectors inside the target backend runtime containers. Do not claim data was collected for a backend/version unless the collector code ran in that container on the target GPU.
+- Full collection means every supported registry op for the requested backend/version has either finished with real rows or is explicitly unsupported by that runtime/GPU with evidence.
+- Smoke and `--limit` runs are only gates before the full run; never present them as final data.
+- Keep working through multi-hour or multi-day runs. Use resume checkpoints, inspect errors, patch, and retry.
+- Make small signed commits as progress checkpoints, especially before long waits or after each backend/op family is accepted.
+- Do not synthesize missing rows. Unsupported runtime/kernel paths should be filtered or documented, not filled with fake numbers.
+- If the PR body says customer support is ready, verify the default AIC workflow can actually choose a valid configuration for at least the expected representative model/backend/system path.
+
 ## Required Inputs
 
 Establish these before collecting:
 
 - Target AIC repo and branch.
-- Target backend and version: `sglang`, `vllm`, or `trtllm`.
+- Target backend and version: `sglang`, `vllm`, `trtllm`, or all three.
+- Target runtime container image for each backend, such as:
+  - `nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:<tag>`
+  - `nvcr.io/nvidia/ai-dynamo/sglang-runtime:<tag>`
+  - `nvcr.io/nvidia/ai-dynamo/vllm-runtime:<tag>`
 - Target system name, such as `rtxpro6000_blackwell_server`.
 - Target ops: start narrow, then expand to all relevant registry ops.
 - Whether to collect power columns.
@@ -47,6 +63,44 @@ PY
 export PYTHONPATH="$PWD"
 export COLLECTOR_LOG_DIR="$PWD/collector_logs"
 mkdir -p "$COLLECTOR_LOG_DIR"
+```
+
+Local validation often works with the repo's pinned environment:
+
+```bash
+uv run --frozen ruff check <files>
+uv run --frozen ruff format --check <files>
+uv run --frozen pytest <tests> -q
+```
+
+If the local `uv` environment lacks framework packages such as `torch`, run framework-dependent collector smoke tests in the runtime container instead of trying to mutate the host environment.
+
+Container pattern:
+
+```bash
+docker run --rm -it --gpus all --ipc=host --network host \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v "$PWD:/workspace" -w /workspace \
+  <runtime-image> bash
+
+export PYTHONPATH=/workspace
+export COLLECTOR_LOG_DIR=/workspace/collector_logs/<backend>/<version>/<op>
+mkdir -p "$COLLECTOR_LOG_DIR"
+python collector/collect.py --backend <backend> --ops <op> --smoke
+python collector/collect.py --backend <backend> --ops <op> --resume
+```
+
+Inside the container, record the real framework version:
+
+```bash
+python - <<'PY'
+import importlib.metadata as m
+for pkg in ("tensorrt_llm", "sglang", "vllm"):
+    try:
+        print(pkg, m.version(pkg))
+    except Exception:
+        pass
+PY
 ```
 
 ## Phase 2: Add Or Validate System Metadata
@@ -99,6 +153,14 @@ Recommended order:
 
 For new GPUs, prioritize ops used by the target models and backend first, but do not claim full support until all expected ops for that backend/version are collected or explicitly marked unsupported.
 
+For an all-backend bring-up, run this as three separate backend projects in one PR:
+
+1. TRT-LLM runtime container and version.
+2. SGLang runtime container and version.
+3. vLLM runtime container and version.
+
+For each backend, enumerate registry ops and create a tracking table with: op, perf filename, smoke status, full status, row count, duplicate-key status, AIC sanity status, and unsupported notes. Keep this table in a local scratch file and summarize it in the PR body.
+
 ## Phase 4: Progressive Collection Loop
 
 For each op:
@@ -118,6 +180,30 @@ mkdir -p "$COLLECTOR_LOG_DIR"
 ```
 
 If the process times out or crashes after partial progress, rerun with `--resume`. Keep checkpoints until the op is accepted.
+
+Full-collection acceptance for an op:
+
+- The final collector run has zero unclassified errors, or every remaining skipped case is intentionally filtered before execution.
+- The output perf file was copied from the full output directory, not from an earlier smoke/limited run.
+- Row counts are plausible compared with nearby systems or the generated case count.
+- Duplicate shape keys are removed only when they are true repeated measurements for the same key; keep the latest or best-defined row consistently and document the policy.
+- The op is not required by AIC's default query path, or if it is required, representative AIC CLI/chart generation can consume it.
+
+For very long runs, commit and push safe progress periodically:
+
+```bash
+git status --short
+git add collector tests src/aiconfigurator/systems
+git commit --signoff -m "<backend>: <op family> progress"
+git push
+```
+
+Use signed commits. If DCO fails because a commit lacks `Signed-off-by`, amend only the latest commit if appropriate:
+
+```bash
+git commit --amend --no-edit --signoff
+git push --force-with-lease
+```
 
 ## Phase 5: Fix Collector Errors
 
@@ -151,6 +237,10 @@ Fix policy:
 - For CUDA-fatal errors, prefer worker restart and skip only the exact invalid region.
 - Preserve data quality. Do not reduce benchmark repetitions or broad test dimensions just to pass.
 - Keep older backend versions working.
+- Keep shared test-case generators deterministic when unit tests depend on them. Put runtime availability probes in backend collector wrappers when the skip is caused by a partially installed framework package.
+- Guard `importlib.util.find_spec("a.b.c")` with `try/except ModuleNotFoundError`; partial packages can make `find_spec` raise instead of return `None`.
+- If a collector route only exists for future framework versions, use `VersionRoute` in `collector/<backend>/registry.py` and add a wrapper module with an explicit `__compat__`.
+- If a collector helper silently returns `None` after a dry-run or subprocess failure, make it raise or record the skip explicitly so failed coverage is visible.
 
 After a fix:
 
@@ -165,8 +255,34 @@ Commit small fixes:
 
 ```bash
 git add collector tests
-git commit -m "fix <backend> <op> collector for <system>"
+git commit --signoff -m "fix <backend> <op> collector for <system>"
 ```
+
+### Backend-Specific Failure Patterns
+
+Use these as starting hypotheses, then verify against the actual runtime source and logs.
+
+TRT-LLM:
+
+- Compute-scale latency may legitimately be zero when `max(0, dynamic_quantize - static_quantize)` clamps a dynamic path that measured faster than the static baseline. Verify with remeasurement; do not invent positive latency.
+- Some GDN collectors require newer TRT-LLM than the runtime image provides. Route by framework version instead of registering an unusable op.
+- DSA or sparse MLA modules may be unsupported for a new SM/runtime combination. Filter unsupported cases before execution and document the runtime limitation.
+- For Blackwell/SM120 attention and FP8/FP4 paths, check per-rank dimensions, kv dtype, and kernel architecture support before collecting.
+
+SGLang:
+
+- DeepGEMM, FlashInfer, DSV4, MHC, and MLA paths can be present in source but unavailable for the active SM or installed package set.
+- MLA prefill/generation may have hard-coded head/group constraints on new architectures. Restrict to verified safe shapes rather than allowing fatal CUDA crashes.
+- If `sglang` is partially installed in a unit-test image, `sglang.srt...` probes can raise. Runtime skip checks belong in `collector/sglang/collect_*.py` wrappers, not necessarily in `collector/common_test_cases.py`.
+- For DSV4/MHC, distinguish "case grid exists" from "runtime module exists"; unit tests may assert the former while the collector should enforce the latter.
+
+vLLM:
+
+- Newer ops such as GDN may not exist in older vLLM runtime images. Add version routing, for example route GDN only for `vllm>=0.17.0` if `0.16.0` lacks the collector API.
+- FP8 block GEMM and quantized GEMM paths can have high memory use or graph/eager timing differences. Prefer the runtime-supported timing mode and reduce memory pressure without reducing intended coverage.
+- FP8 KV-cache attention or MLA module combinations may not be supported by the installed runtime. Filter unsupported kv dtype/module combinations early.
+- Cap generation module cases that exceed runtime limits such as very large `batch * sequence` regions, and document the cap.
+- When copying final vLLM data, scan for duplicate keys. Some repeated collection paths can produce duplicate shape rows.
 
 ## Phase 6: Perf File Quality Gates
 
@@ -175,7 +291,7 @@ Accept a perf file only when:
 - It exists under `src/aiconfigurator/systems/data/<system>/<backend>/<version>/`.
 - It is not empty and has the expected CSV header.
 - Rows contain the expected framework, version, and device name.
-- Latency values are positive, finite, and plausible.
+- Latency values are finite and plausible. They should usually be positive; allow zero only for documented modeled-overhead files such as compute-scale where the collector intentionally clamps negative overhead to zero.
 - Power values, when collected, are positive and below/near the configured power limit.
 - There are no unexplained duplicate rows for identical keys.
 - Coverage is comparable to the nearest existing system/backend/version.
@@ -199,6 +315,8 @@ PY
 ```
 
 Compare row counts and latency ranges with nearby systems, such as H100/H200 for Hopper or B200/B300 for Blackwell.
+
+Run a duplicate-key scan using the loader's expected key columns when possible. If no helper exists, group rows by all non-metric columns and report duplicates per file. Do not blindly dedupe rows before understanding whether repeated dimensions differ by dtype, backend, tensor parallelism, or model field.
 
 ## Phase 7: Verify AIC Consumption
 
@@ -230,6 +348,24 @@ aiconfigurator cli generate --model-path <model> --total-gpus <n> --system <syst
 
 If AIC raises `PerfDataNotAvailableError`, either collect the missing op or document that the model/backend mode is not supported. Do not claim support for a model path that still hits missing data.
 
+Run sanity chart generation before declaring the PR ready:
+
+```bash
+rm -rf sanity_<system> && mkdir -p sanity_<system>
+uv run --frozen python tools/sanity_check/create_charts.py \
+  --base-ref origin/main \
+  --head-ref HEAD \
+  --output-dir sanity_<system> \
+  --output-md-file sanity_<system>/comment.md
+```
+
+Read the generated report, not just the exit code. Fix hard failures where possible:
+
+- Missing data for default workflow shapes usually means collection coverage is incomplete.
+- Empty chart grids can be acceptable only when the runtime has no valid silicon data for that op/shape family; convert those to explicit skips with a clear reason.
+- If both aggregated and disaggregated configs have no valid parallel configuration, the backend/version is registered but not usable. Collect the missing required shapes or do not claim default workflow support.
+- CLI smoke in the report must pass for each backend/version claimed ready.
+
 ## Phase 8: Support Matrix And Documentation
 
 If the new GPU should become user-visible:
@@ -259,15 +395,33 @@ pytest tests/unit/sdk/test_common.py -q
 
 PR body checklist:
 
+- A concrete "Release at a Glance"; avoid generic claims like "metrics below show improvements" unless the tables explain those improvements.
+- Customer impact: what is now selectable/usable in AIC, and for which default model/backend/system path.
 - GPU node identity and `nvidia-smi` summary.
-- CUDA driver/container/backend image.
-- Backend version detected at runtime.
+- CUDA driver/container/backend image for each backend.
+- Backend version detected at runtime, not assumed from the image tag.
 - System YAML changes.
 - Ops collected and perf files added.
+- Row counts by backend/version and perf file count.
 - Collector errors fixed.
-- Unsupported/skipped configs with reasons.
+- Unsupported/skipped configs with reasons and whether they are runtime-version limits, SM limits, or collector gaps.
 - Validation commands and results.
 - Remaining risks.
+
+If GitHub CLI PR editing fails because of deprecated project-card GraphQL fields, update the PR body through the REST API:
+
+```bash
+gh api repos/<owner>/<repo>/pulls/<number> -X PATCH -f body="$(cat pr_body.md)"
+```
+
+Check CI after every push:
+
+```bash
+gh pr checks <number>
+gh run view <run-id> --log-failed
+```
+
+Ruff CI runs both `ruff check` and `ruff format --check`; local targeted `ruff check` alone is not enough.
 
 Open the PR:
 
