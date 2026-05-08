@@ -1,13 +1,13 @@
 ---
-name: aic-gpu-perf-bringup
-description: Use when running on a GPU node to collect AIC/aiconfigurator perf data for an existing or new GPU type, fix collector errors autonomously, recollect until data quality is acceptable, verify AIC can use the new perf files, and prepare a GitHub PR to ai-dynamo/aiconfigurator.
+name: aic-auto-collect
+description: Use when running long AIC/aiconfigurator GPU perf auto-collection for a specific GPU/framework/framework_version, including draft-PR checkpoints, resumable collect_xx.py runs, framework-version/kernel preflight, collector fixes/skips, special runtime images, validation, and PR handoff.
 ---
 
-# AIC GPU Perf Bring-Up
+# AIC Auto Collect
 
 ## Goal
 
-You are already on a GPU node with one or more GPUs. Your job is to collect AIC perf data for a target GPU/system/backend/version, fix collector failures, recollect until the perf files are good enough, verify AIC can consume the new data, and prepare a PR to `ai-dynamo/aiconfigurator`.
+You are already on a GPU node with one or more GPUs. Your job is to collect AIC perf data for one target `(GPU system, framework/backend, framework version)`, fix collector failures, recollect until the perf files are good enough, verify AIC can consume the new data, and maintain a draft PR to `ai-dynamo/aiconfigurator` as the checkpoint.
 
 This is a long-running workflow. Be persistent. Iterate carefully. Do not hide failures by shrinking coverage or deleting hard cases unless the configuration is genuinely unsupported and documented.
 
@@ -16,7 +16,7 @@ This is a long-running workflow. Be persistent. Iterate carefully. Do not hide f
 If starting from a fresh disposable Brev GPU VM and the user wants unattended Codex work, use the bundled setup script:
 
 ```bash
-bash aic-gpu-perf-bringup/scripts/setup-brev-yolo.sh
+bash aic-auto-collect/scripts/setup-brev-yolo.sh
 ```
 
 The script installs/uses `nvm`, Node.js, and the Codex CLI, writes NVIDIA inference credentials to `~/.config/nvidia/api-env` with user-only permissions, and creates `~/.local/bin/codex-yolo`.
@@ -27,7 +27,7 @@ Noninteractive or customized use:
 export NVIDIA_INFERENCE_API_KEY="<sk-key>"
 export MODEL="openai/openai/gpt-5.3-codex"
 export NODE_VERSION="20"
-bash aic-gpu-perf-bringup/scripts/setup-brev-yolo.sh
+bash aic-auto-collect/scripts/setup-brev-yolo.sh
 ```
 
 Only use `codex-yolo` on isolated throwaway nodes where bypassing approvals and sandboxing is acceptable.
@@ -39,8 +39,10 @@ Assume the user wants the complete bring-up unless they explicitly ask for a smo
 - Run collectors inside the target backend runtime containers. Do not claim data was collected for a backend/version unless the collector code ran in that container on the target GPU.
 - Full collection means every supported registry op for the requested backend/version has either finished with real rows or is explicitly unsupported by that runtime/GPU with evidence.
 - Smoke and `--limit` runs are only gates before the full run; never present them as final data.
-- Keep working through multi-hour or multi-day runs. Use resume checkpoints, inspect errors, patch, and retry.
-- Make small signed commits as progress checkpoints, especially before long waits or after each backend/op family is accepted.
+- Keep working through multi-hour or multi-day runs. Use stable resume checkpoints, inspect errors, patch, and retry.
+- The unit of work is one draft PR per `(system, backend, backend_version)`. Use that PR as the checkpoint, not a private local branch.
+- Make small sign-off commits as progress checkpoints after each `collect_xx.py`/op-family collection finishes. If a single collection runs longer than about one hour, checkpoint safe collector fixes, current perf outputs, and the failure/status summary before continuing.
+- If multiple frameworks are requested, finish and checkpoint one framework/version PR first, then create a new draft PR for the next framework/version.
 - Do not synthesize missing rows. Unsupported runtime/kernel paths should be filtered or documented, not filled with fake numbers.
 - If the PR body says customer support is ready, verify the default AIC workflow can actually choose a valid configuration for at least the expected representative model/backend/system path.
 
@@ -49,7 +51,7 @@ Assume the user wants the complete bring-up unless they explicitly ask for a smo
 Establish these before collecting:
 
 - Target AIC repo and branch.
-- Target backend and version: `sglang`, `vllm`, `trtllm`, or all three.
+- Target backend and version: `sglang`, `vllm`, or `trtllm`. Treat "all three" as an ordered queue of separate draft PRs.
 - Target runtime container image for each backend, such as:
   - `nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:<tag>`
   - `nvcr.io/nvidia/ai-dynamo/sglang-runtime:<tag>`
@@ -76,14 +78,17 @@ PY
 ## Phase 1: Prepare Repo
 
 1. Clone or update `ai-dynamo/aiconfigurator`.
-2. Create a branch named like `data/<system>-<backend>-<version>`.
-3. Install only lightweight local dev dependencies needed for tests. Do not install the target backend locally unless the collector is not running in a backend container.
-4. Set:
+2. Create a branch named like `data/<system>-<backend>-<version>` or `codex/<system>-<backend>-<version>`.
+3. Immediately create a draft PR for this `(system, backend, version)` once the branch exists and the scope is known. Use it as the remote checkpoint even before all data is ready.
+4. Install only lightweight local dev dependencies needed for tests. Do not install the target backend locally unless the collector is not running in a backend container.
+5. Set:
 
 ```bash
 export PYTHONPATH="$PWD"
 export COLLECTOR_LOG_DIR="$PWD/collector_logs"
+export COLLECTOR_CHECKPOINT_DIR="$PWD/collector_checkpoints"
 mkdir -p "$COLLECTOR_LOG_DIR"
+mkdir -p "$COLLECTOR_CHECKPOINT_DIR"
 ```
 
 Local validation often works with the repo's pinned environment:
@@ -108,7 +113,8 @@ export PYTHONPATH=/workspace
 export COLLECTOR_LOG_DIR=/workspace/collector_logs/<backend>/<version>/<op>
 mkdir -p "$COLLECTOR_LOG_DIR"
 python collector/collect.py --backend <backend> --ops <op> --smoke
-python collector/collect.py --backend <backend> --ops <op> --resume
+python collector/collect.py --backend <backend> --ops <op> \
+  --checkpoint-dir "$COLLECTOR_CHECKPOINT_DIR/<backend>/<version>/<op>" --resume
 ```
 
 Inside the container, record the real framework version:
@@ -123,6 +129,8 @@ for pkg in ("tensorrt_llm", "sglang", "vllm"):
         pass
 PY
 ```
+
+Update the draft PR body whenever scope changes or a meaningful checkpoint lands. Include current status, what is still partial, and links or paths to failure summaries.
 
 ## Phase 2: Add Or Validate System Metadata
 
@@ -150,7 +158,24 @@ Run:
 pytest tests/unit/sdk/test_common.py -q
 ```
 
-## Phase 3: Choose Collection Plan
+## Phase 3: Framework Version And Kernel Preflight
+
+Before collecting a new framework version or a new GPU SM target, check whether collector code matches the runtime. This avoids spending hours on known-bad grids.
+
+1. Record the exact runtime package version from inside the container. Do not trust only the image tag.
+2. Inspect `collector/<backend>/registry.py` for version routes and the concrete `collect_xx.py` files registered for this version.
+3. Read the top of each relevant `collect_xx.py` file: docstring, `__compat__`, version notes, SM gates, and known unsupported filters.
+4. Compare against the framework source for the exact version/tag when there is any sign of API or kernel churn:
+   - SGLang: attention backends, DeepGEMM, FlashInfer, DeepSeek/DSV module code, MoE runner paths.
+   - vLLM: attention/MLA modules, quantized GEMM paths, GDN/Mamba modules, custom all-reduce.
+   - TRT-LLM: attention plugins, MLA/DSA modules, MoE, compute-scale, GDN/Mamba modules.
+5. For a new SM such as SM120, check kernel architecture support before full collection: tiny smoke cases, import probes, and direct framework source guards.
+6. Patch collector routing or test-case generation before full collection when the runtime cannot support a case. Use version routing and explicit SM filters rather than discovering the same failure across thousands of tasks.
+7. If a special framework image exists for a model family or kernel family, try that image before declaring the op unsupported. Record its exact package version and image digest.
+
+Commit and push preflight collector fixes before starting long full runs.
+
+## Phase 4: Choose Collection Plan
 
 Read the backend registry:
 
@@ -174,15 +199,15 @@ Recommended order:
 
 For new GPUs, prioritize ops used by the target models and backend first, but do not claim full support until all expected ops for that backend/version are collected or explicitly marked unsupported.
 
-For an all-backend bring-up, run this as three separate backend projects in one PR:
+For an all-backend bring-up, run this as separate draft PRs:
 
-1. TRT-LLM runtime container and version.
-2. SGLang runtime container and version.
-3. vLLM runtime container and version.
+1. Finish one GPU/framework/framework_version PR.
+2. Push final data and collector fixes for that framework.
+3. Create the next draft PR for the next framework/version.
 
-For each backend, enumerate registry ops and create a tracking table with: op, perf filename, smoke status, full status, row count, duplicate-key status, AIC sanity status, and unsupported notes. Keep this table in a local scratch file and summarize it in the PR body.
+For each backend/version, enumerate registry ops and create a tracking table with: op, collector file, perf filename, smoke status, full status, row count, duplicate-key status, AIC sanity status, and unsupported notes. Keep this table in a local scratch file and summarize it in the PR body.
 
-## Phase 4: Progressive Collection Loop
+## Phase 5: Progressive Collection Loop
 
 For each op:
 
@@ -190,17 +215,25 @@ For each op:
 python3 collector/collect.py --backend <backend> --ops <op> --smoke
 python3 collector/collect.py --backend <backend> --ops <op> --shuffle --limit 20
 python3 collector/collect.py --backend <backend> --ops <op> --shuffle --limit 100
-python3 collector/collect.py --backend <backend> --ops <op> --resume
+python3 collector/collect.py --backend <backend> --ops <op> \
+  --checkpoint-dir "$COLLECTOR_CHECKPOINT_DIR/<backend>/<version>/<op>" --resume
 ```
 
 Use a separate log directory per op when iterating:
 
 ```bash
 export COLLECTOR_LOG_DIR="$PWD/collector_logs/<backend>/<version>/<op>"
+export COLLECTOR_CHECKPOINT_DIR="$PWD/collector_checkpoints"
 mkdir -p "$COLLECTOR_LOG_DIR"
+mkdir -p "$COLLECTOR_CHECKPOINT_DIR/<backend>/<version>/<op>"
 ```
 
-If the process times out or crashes after partial progress, rerun with `--resume`. Keep checkpoints until the op is accepted.
+If the process times out or crashes after partial progress, rerun with the same `--checkpoint-dir` and `--resume`. Keep checkpoints until the op is accepted. If the process has been running for about an hour, checkpoint safe progress:
+
+- Commit collector fixes and tests.
+- Copy currently produced perf files only if they are clearly labeled or known to be append-safe for replacement by a later full run.
+- Push the draft PR branch.
+- Update the PR body or a tracked status note with current op, completed cases, row counts, and active failures.
 
 Full-collection acceptance for an op:
 
@@ -219,14 +252,14 @@ git commit --signoff -m "<backend>: <op family> progress"
 git push
 ```
 
-Use signed commits. If DCO fails because a commit lacks `Signed-off-by`, amend only the latest commit if appropriate:
+Use sign-off commits. If DCO fails because a commit lacks `Signed-off-by`, amend only the latest commit if appropriate:
 
 ```bash
 git commit --amend --no-edit --signoff
 git push --force-with-lease
 ```
 
-## Phase 5: Fix Collector Errors
+## Phase 6: Fix Collector Errors
 
 When a run fails, inspect:
 
@@ -234,6 +267,8 @@ When a run fails, inspect:
 - `errors_*.json`
 - worker logs in `COLLECTOR_LOG_DIR`
 - traceback module and task parameters
+
+Maintain a failure ledger for the active PR. For each failure group record: op, collector file, runtime image/version, SM, task params, exact error, classification, action taken, and whether an upstream issue was filed.
 
 Classify each error group:
 
@@ -262,6 +297,8 @@ Fix policy:
 - Guard `importlib.util.find_spec("a.b.c")` with `try/except ModuleNotFoundError`; partial packages can make `find_spec` raise instead of return `None`.
 - If a collector route only exists for future framework versions, use `VersionRoute` in `collector/<backend>/registry.py` and add a wrapper module with an explicit `__compat__`.
 - If a collector helper silently returns `None` after a dry-run or subprocess failure, make it raise or record the skip explicitly so failed coverage is visible.
+- If a valid production-like case fails in the framework kernel, file or prepare an upstream bug for SGLang, vLLM, or TRT-LLM with exact image/version, SM, minimal repro, and traceback. Link it in the PR or failure ledger.
+- If the case is not production-like or the runtime explicitly does not support that SM/path, skip it in `collect_xx.py` before execution with a clear comment and a narrow predicate.
 
 After a fix:
 
@@ -269,7 +306,8 @@ After a fix:
 pytest tests/unit/collector -q
 python3 collector/collect.py --backend <backend> --ops <op> --smoke
 python3 collector/collect.py --backend <backend> --ops <op> --shuffle --limit 100
-python3 collector/collect.py --backend <backend> --ops <op> --resume
+python3 collector/collect.py --backend <backend> --ops <op> \
+  --checkpoint-dir "$COLLECTOR_CHECKPOINT_DIR/<backend>/<version>/<op>" --resume
 ```
 
 Commit small fixes:
@@ -305,7 +343,7 @@ vLLM:
 - Cap generation module cases that exceed runtime limits such as very large `batch * sequence` regions, and document the cap.
 - When copying final vLLM data, scan for duplicate keys. Some repeated collection paths can produce duplicate shape rows.
 
-## Phase 6: Perf File Quality Gates
+## Phase 7: Perf File Quality Gates
 
 Accept a perf file only when:
 
@@ -339,7 +377,7 @@ Compare row counts and latency ranges with nearby systems, such as H100/H200 for
 
 Run a duplicate-key scan using the loader's expected key columns when possible. If no helper exists, group rows by all non-metric columns and report duplicates per file. Do not blindly dedupe rows before understanding whether repeated dimensions differ by dtype, backend, tensor parallelism, or model field.
 
-## Phase 7: Verify AIC Consumption
+## Phase 8: Verify AIC Consumption
 
 Run loader and SDK tests:
 
@@ -387,7 +425,7 @@ Read the generated report, not just the exit code. Fix hard failures where possi
 - If both aggregated and disaggregated configs have no valid parallel configuration, the backend/version is registered but not usable. Collect the missing required shapes or do not claim default workflow support.
 - CLI smoke in the report must pass for each backend/version claimed ready.
 
-## Phase 8: Support Matrix And Documentation
+## Phase 9: Support Matrix And Documentation
 
 If the new GPU should become user-visible:
 
@@ -396,7 +434,7 @@ If the new GPU should become user-visible:
 3. Add or update tests for new SM filters or version routes.
 4. Document known gaps in the PR body.
 
-## Phase 9: PR Preparation
+## Phase 10: PR Preparation
 
 Keep commits reviewable:
 
@@ -405,7 +443,7 @@ Keep commits reviewable:
 3. `add <system> <backend> <version> perf data`
 4. `test <system> data loading`
 
-Before opening the PR:
+Before marking the draft PR ready:
 
 ```bash
 git status --short
@@ -444,7 +482,7 @@ gh run view <run-id> --log-failed
 
 Ruff CI runs both `ruff check` and `ruff format --check`; local targeted `ruff check` alone is not enough.
 
-Open the PR:
+If the draft PR does not exist yet, open it before more long-running work:
 
 ```bash
 gh repo fork ai-dynamo/aiconfigurator --clone=false
